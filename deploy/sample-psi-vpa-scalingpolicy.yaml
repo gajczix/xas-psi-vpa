@@ -1,0 +1,68 @@
+apiVersion: xas.io/v1
+kind: ScalingPolicy
+metadata:
+  name: thrashing-app-psi-vpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: thrashing-app
+  minReplicas: 1
+  maxReplicas: 1
+
+  metrics:
+    # 1. Memory PSI stall percentage (from memory.pressure)
+    - name: "memory_psi"
+      provider: "psi"
+      scope: "PodContainer"
+      params:
+        type: "memory_psi"
+      gauge:
+        aggregation: "Max"
+
+    # 2. I/O PSI stall percentage (from io.pressure)
+    - name: "io_psi"
+      provider: "psi"
+      scope: "PodContainer"
+      params:
+        type: "io_psi"
+      gauge:
+        aggregation: "Max"
+
+    # 3. Page refault & swap-in rate (from memory.stat: workingset_refault_file + pswpin)
+    - name: "refault_rate"
+      provider: "psi"
+      scope: "PodContainer"
+      params:
+        type: "refault_rate"
+      gauge:
+        aggregation: "Max"
+
+    # 4. Current memory limit in bytes (from memory.max)
+    - name: "current_memory_limit"
+      provider: "psi"
+      scope: "PodContainer"
+      params:
+        type: "current_memory_limit"
+      gauge:
+        aggregation: "Max"
+
+  scaling:
+    # Slide 27 4-metric decision tree recommender
+    - recommender: "psi-vpa"
+      name: "psi_memory_rescue"
+      params:
+        container: "app"
+        memoryPSIMetric: "memory_psi"
+        ioPSIMetric: "io_psi"
+        refaultRateMetric: "refault_rate"
+        memoryLimitMetric: "current_memory_limit"
+        targetMemPSI: "10.0"      # Act when memory PSI > 10%
+        targetIOPSI: "15.0"       # Act when I/O PSI > 15% (if paired with refaults)
+        minRefaultRate: "100.0"   # Minimum refaults/sec to confirm disguised memory starvation
+        stepUpFactor: "0.15"      # Grow memory limit by +15% per step
+        cooldown: "8s"            # Stabilization window after a scale-up before stepping up again
+        minMemory: "64Mi"
+        maxMemory: "512Mi"
+        mode: "Active"

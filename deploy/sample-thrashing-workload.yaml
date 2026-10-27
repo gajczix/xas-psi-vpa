@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thrashing-app
+  namespace: default
+  labels:
+    app: thrashing-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: thrashing-app
+  template:
+    metadata:
+      labels:
+        app: thrashing-app
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: app
+          image: mirror.gcr.io/library/python:3.11-slim
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: NotRequired
+            - resourceName: memory
+              restartPolicy: NotRequired
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "256Mi"
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import os, time, threading
+
+              DATA_DIR = "/data"
+              os.makedirs(DATA_DIR, exist_ok=True)
+              hot_fn = os.path.join(DATA_DIR, "hot_vpa.dat")
+
+              print("PHASE=0_INIT Preparing 280MB dataset on disk...", flush=True)
+              chunk = b"V" * (1024 * 1024)
+              with open(hot_fn, "wb") as f:
+                  for _ in range(280):
+                      f.write(chunk)
+              os.sync()
+
+              # Allocate 24MB anonymous memory (24MB + 280MB = 304MB working set inside 256Mi limit)
+              anon = bytearray(24 * 1024 * 1024)
+              for i in range(0, len(anon), 4096):
+                  anon[i] = 1
+
+              fd_h = os.open(hot_fn, os.O_RDONLY)
+
+              WARMUP_SECONDS = int(os.environ.get("WARMUP_SECONDS", "15"))
+              start_ts = time.monotonic()
+
+              def active_window_mb():
+                  # Phase 1 (first 15s): read only 64MB window (fits easily inside 256Mi -> ~0.8ms p99)
+                  # Phase 2 (after 15s): read full 280MB window (304MB total > 295Mi -> requires 2 steps: 256Mi -> 295Mi -> 340Mi)
+                  if time.monotonic() - start_ts < WARMUP_SECONDS:
+                      return 64
+                  return 280
+
+              def bg_reader():
+                  step = 0
+                  while True:
+                      win_mb = active_window_mb()
+                      if win_mb <= 64:
+                          time.sleep(0.05)
+                          continue
+                      base = ((step * 8) % win_mb) * 1024 * 1024
+                      for off in range(base, min(base + 8 * 1024 * 1024, win_mb * 1024 * 1024), 65536):
+                          os.pread(fd_h, 65536, off)
+                      step += 1
+
+              t = threading.Thread(target=bg_reader, daemon=True)
+              t.start()
+
+              print(f"PHASE=1_HEALTHY_WARMUP Starting {WARMUP_SECONDS}s healthy baseline (64MB window)...", flush=True)
+              req = 0
+              lats = []
+              last_log = time.monotonic()
+              announced_thrash = False
+              while True:
+                  win_mb = active_window_mb()
+                  if win_mb == 280 and not announced_thrash:
+                      print("PHASE=2_FULL_LOAD Switching to 280MB hot file + 24MB anon (304MB working set)...", flush=True)
+                      announced_thrash = True
+                  t0 = time.monotonic()
+                  base = ((req * 4) % win_mb) * 1024 * 1024
+                  for off in range(base, min(base + 4 * 1024 * 1024, win_mb * 1024 * 1024), 65536):
+                      os.pread(fd_h, 65536, off)
+                  dt_ms = (time.monotonic() - t0) * 1000.0
+                  lats.append(dt_ms)
+                  req += 1
+                  if time.monotonic() - last_log >= 1.0 and lats:
+                      lats.sort()
+                      p99 = lats[int(0.99 * (len(lats) - 1))]
+                      phase = "1_WARMUP_64MB" if win_mb == 64 else "2_ACTIVE_304MB"
+                      print(f"PHASE={phase} LATENCY_P99_MS={p99:.3f} samples={len(lats)}", flush=True)
+                      lats.clear()
+                      last_log = time.monotonic()
+                  time.sleep(0.01)
+          volumeMounts:
+            - name: disk-scratch
+              mountPath: /data
+      volumes:
+        - name: disk-scratch
+          hostPath:
+            path: /var/lib/psi-exp2-xas
+            type: DirectoryOrCreate
